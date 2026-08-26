@@ -73,7 +73,10 @@ def launch_chrome() -> dict:
         [
             chrome_path,
             f"--remote-debugging-port={CHROME_PORT}",
+            "--remote-allow-origins=*",
             f"--user-data-dir={profile_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
             CHROME_URL,
         ],
         stdout=subprocess.DEVNULL,

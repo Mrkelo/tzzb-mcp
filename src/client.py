@@ -1,12 +1,17 @@
-"""HTTP 客户端封装"""
+"""HTTP 客户端 — 通过 Chrome CDP 代理请求"""
 
+from __future__ import annotations
+
+import json
+import time
 from typing import Any
 
 import httpx
+import websocket
 
 from .auth import get_cookies, clear as clear_cookies
 
-BASE_URL = "https://tzzb.10jqka.com.cn"
+CHROME_PORT = 9222
 API_PREFIX = "/caishen_httpserver/tzzb"
 
 
@@ -19,113 +24,119 @@ class TzzbError(Exception):
         super().__init__(message)
 
 
-async def _request(endpoint: str, params: dict[str, Any] | None = None, retries: int = 1) -> dict:
-    """发送 API 请求
+def _get_mcp_page() -> dict:
+    """获取投资账本页面的 CDP target"""
+    r = httpx.get(f"http://localhost:{CHROME_PORT}/json", timeout=5)
+    targets = r.json()
+    for t in targets:
+        if t.get("type") == "page" and "tzzb" in t.get("url", ""):
+            return t
+    raise TzzbError("未找到投资账本页面，请确保 Chrome 已打开并登录 tzzb.10jqka.com.cn", status_code=401)
 
-    Args:
-        endpoint: API 路径，如 /caishen_fund/pc/account/v1/account_list
-        params: 额外请求参数
-        retries: 重试次数
+
+def _cdp_fetch(endpoint: str, params: dict[str, Any] | None = None) -> dict:
+    """通过 CDP 在浏览器中执行 fetch 请求
+
+    同花顺使用 hexin-v 动态反爬标头（由 chameleon 库生成），
+    无法在 Python 中模拟，必须通过浏览器原生网络栈发起请求。
     """
     cookies = get_cookies()
     if not cookies:
         raise TzzbError("未登录，请先调用 tzzb_login 完成认证", status_code=401)
 
     userid = cookies.get("userid", "")
-    data = {
+
+    # 构建 POST body
+    body_parts = {
         "terminal": "1",
         "version": "0.0.0",
         "userid": userid,
         "user_id": userid,
         **(params or {}),
     }
+    body_str = "&".join(f"{k}={v}" for k, v in body_parts.items())
 
-    url = f"{BASE_URL}{API_PREFIX}{endpoint}"
-    last_error: Exception | None = None
+    # 构建 JS fetch 代码
+    js_code = f"""
+    (async () => {{
+        try {{
+            const resp = await fetch('{API_PREFIX}{endpoint}', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+                body: {json.dumps(body_str)}
+            }});
+            const text = await resp.text();
+            return JSON.stringify({{
+                status: resp.status,
+                body: text,
+                ok: resp.ok
+            }});
+        }} catch(e) {{
+            return JSON.stringify({{
+                status: 0,
+                body: e.message,
+                ok: false
+            }});
+        }}
+    }})()
+    """
 
-    for attempt in range(retries + 1):
-        try:
-            async with httpx.AsyncClient(
-                cookies=cookies,
-                timeout=httpx.Timeout(30.0),
-                follow_redirects=True,
-            ) as client:
-                r = await client.post(
-                    url,
-                    data=data,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                )
+    # 连接 CDP
+    page = _get_mcp_page()
+    ws = websocket.WebSocket()
+    ws.settimeout(30)
+    ws.connect(page["webSocketDebuggerUrl"])
 
-                # Cookie 过期
-                if r.status_code == 401:
-                    clear_cookies()
-                    raise TzzbError("Cookie 已过期，请重新调用 tzzb_login", status_code=401)
-
-                # 服务端异常
-                if r.status_code == 502:
-                    clear_cookies()
-                    raise TzzbError("服务端异常，Cookie 可能已过期，请重新调用 tzzb_login", status_code=502)
-
-                # 频率限制
-                if r.status_code == 403:
-                    if attempt < retries:
-                        import asyncio
-                        await asyncio.sleep(3)
-                        continue
-                    raise TzzbError("请求被频率限制，请稍后重试", status_code=403)
-
-                if r.status_code != 200:
-                    raise TzzbError(f"HTTP {r.status_code}: {r.text[:200]}", status_code=r.status_code)
-
-                result = r.json()
-                if result.get("error_code") != "0":
-                    raise TzzbError(
-                        result.get("error_msg", "请求异常"),
-                        error_code=str(result.get("error_code", "")),
-                    )
-
-                return result.get("ex_data", {})
-
-        except (httpx.TimeoutException, httpx.ConnectError) as e:
-            last_error = e
-            if attempt < retries:
-                import asyncio
-                await asyncio.sleep(2)
-                continue
-            raise TzzbError(f"网络请求失败: {e}") from e
-
-    raise TzzbError(f"请求失败: {last_error}")
-
-
-async def request(endpoint: str, params: dict[str, Any] | None = None) -> dict:
-    """公开 API 请求接口"""
-    return await _request(endpoint, params)
-
-
-async def request_raw(endpoint: str, params: dict[str, Any] | None = None) -> dict:
-    """发送原始请求，返回完整响应（不解析 error_code）"""
-    cookies = get_cookies()
-    if not cookies:
-        raise TzzbError("未登录，请先调用 tzzb_login 完成认证", status_code=401)
-
-    userid = cookies.get("userid", "")
-    data = {
-        "terminal": "1",
-        "version": "0.0.0",
-        "userid": userid,
-        "user_id": userid,
-        **(params or {}),
-    }
-
-    url = f"{BASE_URL}{API_PREFIX}{endpoint}"
-    async with httpx.AsyncClient(
-        cookies=cookies,
-        timeout=httpx.Timeout(30.0),
-        follow_redirects=True,
-    ) as client:
-        r = await client.post(
-            url,
-            data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+    ws.send(
+        json.dumps(
+            {
+                "id": 1,
+                "method": "Runtime.evaluate",
+                "params": {
+                    "expression": js_code,
+                    "awaitPromise": True,
+                    "returnByValue": True,
+                },
+            }
         )
-        return r.json()
+    )
+    response = json.loads(ws.recv())
+    ws.close()
+
+    result = json.loads(response["result"]["result"]["value"])
+    status = result.get("status", 0)
+    body_text = result.get("body", "")
+
+    # 处理 HTTP 错误
+    if status == 401:
+        clear_cookies()
+        raise TzzbError("Cookie 已过期，请重新调用 tzzb_login", status_code=401)
+    if status == 502:
+        clear_cookies()
+        raise TzzbError("服务端异常，Cookie 可能已过期，请重新调用 tzzb_login", status_code=502)
+    if status != 200:
+        raise TzzbError(f"HTTP {status}: {body_text[:200]}", status_code=status)
+
+    # 解析响应
+    try:
+        data = json.loads(body_text)
+    except json.JSONDecodeError:
+        raise TzzbError(f"响应解析失败: {body_text[:200]}")
+
+    if data.get("error_code") != "0":
+        raise TzzbError(
+            data.get("error_msg", "请求异常"),
+            error_code=str(data.get("error_code", "")),
+        )
+
+    return data.get("ex_data", {})
+
+
+def request(endpoint: str, params: dict[str, Any] | None = None) -> dict:
+    """同步 API 请求（MCP 工具调用）"""
+    return _cdp_fetch(endpoint, params)
+
+
+async def request_async(endpoint: str, params: dict[str, Any] | None = None) -> dict:
+    """异步 API 请求"""
+    return _cdp_fetch(endpoint, params)
