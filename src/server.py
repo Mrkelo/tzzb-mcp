@@ -12,7 +12,7 @@ mcp = MCPServer(
     name="tzzb-mcp",
     title="同花顺投资账本",
     description="同花顺投资账本 MCP 服务，提供多账户持仓、交易记录、资产趋势等数据查询",
-    version="0.1.0",
+    version="1.0.0",
 )
 
 
@@ -63,13 +63,19 @@ def tzzb_positions(
     stock_data = position.get_stock_position(
         manual_id=manual_id, fund_key=fund_key, rzrq_fund_key=rzrq_fund_key
     )
-    fund_data = position.get_fund_position(manual_id=manual_id, fund_key=fund_key)
+    try:
+        fund_data = position.get_fund_position(manual_id=manual_id, fund_key=fund_key)
+    except Exception:
+        fund_data = {"error": "基金持仓接口不可用"}
     return {"stock": stock_data, "fund": fund_data}
 
 
 @mcp.tool(name="tzzb_portfolio", description="投资组合总览：账户列表、总资产、持仓汇总、收益率、今日盈亏")
 def tzzb_portfolio() -> dict[str, Any]:
-    return account.get_account_init()
+    try:
+        return account.get_account_init()
+    except TzzbError:
+        return account.get_account_list()
 
 
 @mcp.tool(name="tzzb_asset_trend", description="获取资产/收益趋势数据")
@@ -153,15 +159,7 @@ def tzzb_watchlist(sort_rule: str = "", sort_order: str = "") -> dict[str, Any]:
 
 def main():
     """MCP 服务入口"""
-    import asyncio
-
-    from mcp.server.stdio import stdio_server
-
-    async def run():
-        async with stdio_server() as (read_stream, write_stream):
-            await mcp.run(read_stream, write_stream, mcp.create_initialization_options())
-
-    asyncio.run(run())
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

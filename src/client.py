@@ -1,18 +1,24 @@
-"""HTTP 客户端 — 通过 Chrome CDP 代理请求"""
+"""HTTP 客户端 — 通过 Chrome CDP 代理请求
+
+同花顺使用 hexin-v 动态反爬标头（由 chameleon 库在浏览器 localStorage 中生成），
+Python 直接请求会 401。所有 API 请求通过 CDP Runtime.evaluate 在浏览器内执行 fetch。
+"""
 
 from __future__ import annotations
 
 import json
+import random
 import time
 from typing import Any
 
-import httpx
-import websocket
+from . import auth
+from .auth import cdp_evaluate, get_cookies, clear as clear_cookies
 
-from .auth import get_cookies, clear as clear_cookies
-
-CHROME_PORT = 9222
 API_PREFIX = "/caishen_httpserver/tzzb"
+
+# 空模板特征：页面未加载完成时 API 返回的默认空数据
+# upload_time 为空字符串是关键区分标识（真实空账户也不会有 upload_time）
+EMPTY_TEMPLATE_INDICATORS = {"upload_time": ""}
 
 
 class TzzbError(Exception):
@@ -24,46 +30,43 @@ class TzzbError(Exception):
         super().__init__(message)
 
 
-def _get_mcp_page() -> dict:
-    """获取投资账本页面的 CDP target"""
-    r = httpx.get(f"http://localhost:{CHROME_PORT}/json", timeout=5)
-    targets = r.json()
-    for t in targets:
-        if t.get("type") == "page" and "tzzb" in t.get("url", ""):
-            return t
-    raise TzzbError("未找到投资账本页面，请确保 Chrome 已打开并登录 tzzb.10jqka.com.cn", status_code=401)
+def _is_empty_template(ex_data: dict) -> bool:
+    """检测是否为页面未加载完成时的空模板响应"""
+    if not isinstance(ex_data, dict):
+        return False
+    # 空模板特征：upload_time 为空字符串
+    if ex_data.get("upload_time") == "":
+        return True
+    return False
 
 
-def _cdp_fetch(endpoint: str, params: dict[str, Any] | None = None) -> dict:
-    """通过 CDP 在浏览器中执行 fetch 请求
-
-    同花顺使用 hexin-v 动态反爬标头（由 chameleon 库生成），
-    无法在 Python 中模拟，必须通过浏览器原生网络栈发起请求。
-    """
+def _request_raw(endpoint: str, params: dict[str, Any] | None = None) -> dict:
+    """单次 API 请求（不含重试逻辑）"""
     cookies = get_cookies()
     if not cookies:
         raise TzzbError("未登录，请先调用 tzzb_login 完成认证", status_code=401)
 
     userid = cookies.get("userid", "")
+    _nonce = str(random.randint(100000, 999999))
 
-    # 构建 POST body
     body_parts = {
         "terminal": "1",
         "version": "0.0.0",
         "userid": userid,
         "user_id": userid,
+        "_nc": _nonce,  # 防缓存 nonce，确保每次请求 body 不同
         **(params or {}),
     }
     body_str = "&".join(f"{k}={v}" for k, v in body_parts.items())
 
-    # 构建 JS fetch 代码
     js_code = f"""
     (async () => {{
         try {{
-            const resp = await fetch('{API_PREFIX}{endpoint}', {{
+            const resp = await fetch('{API_PREFIX}{endpoint}?_t=' + Date.now(), {{
                 method: 'POST',
                 headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
-                body: {json.dumps(body_str)}
+                body: {json.dumps(body_str)},
+                cache: 'no-store'
             }});
             const text = await resp.text();
             return JSON.stringify({{
@@ -81,43 +84,26 @@ def _cdp_fetch(endpoint: str, params: dict[str, Any] | None = None) -> dict:
     }})()
     """
 
-    # 连接 CDP
-    page = _get_mcp_page()
-    ws = websocket.WebSocket()
-    ws.settimeout(30)
-    ws.connect(page["webSocketDebuggerUrl"])
+    try:
+        cdp_result = cdp_evaluate(js_code)
+        result = json.loads(cdp_result["result"]["result"]["value"])
+    except KeyError as e:
+        raise TzzbError(f"CDP 响应解析失败: {e}", status_code=500)
+    except Exception as e:
+        raise TzzbError(f"CDP 请求失败（已自动重连重试）: {e}", status_code=500)
 
-    ws.send(
-        json.dumps(
-            {
-                "id": 1,
-                "method": "Runtime.evaluate",
-                "params": {
-                    "expression": js_code,
-                    "awaitPromise": True,
-                    "returnByValue": True,
-                },
-            }
-        )
-    )
-    response = json.loads(ws.recv())
-    ws.close()
-
-    result = json.loads(response["result"]["result"]["value"])
     status = result.get("status", 0)
     body_text = result.get("body", "")
 
-    # 处理 HTTP 错误
     if status == 401:
         clear_cookies()
         raise TzzbError("Cookie 已过期，请重新调用 tzzb_login", status_code=401)
     if status == 502:
         clear_cookies()
-        raise TzzbError("服务端异常，Cookie 可能已过期，请重新调用 tzzb_login", status_code=502)
+        raise TzzbError("服务端异常，请重新调用 tzzb_login", status_code=502)
     if status != 200:
         raise TzzbError(f"HTTP {status}: {body_text[:200]}", status_code=status)
 
-    # 解析响应
     try:
         data = json.loads(body_text)
     except json.JSONDecodeError:
@@ -132,11 +118,40 @@ def _cdp_fetch(endpoint: str, params: dict[str, Any] | None = None) -> dict:
     return data.get("ex_data", {})
 
 
-def request(endpoint: str, params: dict[str, Any] | None = None) -> dict:
-    """同步 API 请求（MCP 工具调用）"""
-    return _cdp_fetch(endpoint, params)
+def request(
+    endpoint: str,
+    params: dict[str, Any] | None = None,
+    max_retries: int = 3,
+) -> dict:
+    """同步 API 请求：通过 CDP 在浏览器内执行 fetch，带空模板检测和重试
 
+    页面未加载完成时（hexin-v 标头未生成），API 会返回空模板（HTTP 200 + error_code 0），
+    不会抛异常。需要通过 upload_time 判断并触发重试。
+    """
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            ex_data = _request_raw(endpoint, params)
+        except TzzbError as e:
+            # 网络/认证错误，直接重试
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(1)
+            continue
 
-async def request_async(endpoint: str, params: dict[str, Any] | None = None) -> dict:
-    """异步 API 请求"""
-    return _cdp_fetch(endpoint, params)
+        # 检查是否为页面未加载完成时的空模板
+        if _is_empty_template(ex_data):
+            last_error = TzzbError(
+                "API 返回空模板（页面可能未加载完成），正在重试...",
+                status_code=503,
+            )
+            if attempt < max_retries - 1:
+                # 等待页面加载完成后再重试
+                time.sleep(2)
+            continue
+
+        return ex_data
+
+    if last_error:
+        raise last_error
+    return {}  # 不应到达

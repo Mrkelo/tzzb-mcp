@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+
+# 虚拟环境
+venv/
+.venv/
+
+# 环境与密钥
+.env
+config.json
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 运行时与本地工作区
+*.log
+*.tmp
+.workbuddy/
+.mcp/
